@@ -327,6 +327,69 @@ function slotKeyLiteral(bind) {
 }
 
 /**
+ * The same problem for an attribute that never bakes into HTML. `action`,
+ * `defaultValue` and friends survive only as a runtime call — the client's
+ * `setFormAction(el, 'action', …)` / `setDefaultValueUncontrolled(el, v)`, the
+ * server's `ssrAttr("action", …)` / `ssrInputAttrs([[false, "defaultValue", …]])`
+ * — whose every other token maps to the VALUE expression. Template origins
+ * cover the baked case; nothing covered this one, so the authored name answered
+ * nothing forwards: the helper is a different word and the name literal carries
+ * quotes, so neither reproduces the authored text the forward index accepts on
+ * its own.
+ *
+ * Claims the name literal in both quotings the printers use (the client prints
+ * `b.literal` bare, the server supplies a JSON raw) plus, when the call belongs
+ * to this attribute alone, the helper alias. A helper SHARED by every attribute
+ * of the element — `ssrInputAttrs`, `ssrAttrs` — passes `null` instead: it is
+ * already anchored on the element, and re-anchoring it on one of its sources
+ * would make that source claim the whole group's lowering.
+ */
+function registerAttrLoweringOrigin(ctx, nameNode, helper, name) {
+	if (!ctx.inspect || !hasAuthoredOrigin(nameNode)) return;
+	const texts = [];
+	if (typeof helper === 'string') texts.push(`_$${helper}`);
+	if (typeof name === 'string' && name !== '') texts.push(`'${name}'`, `"${name}"`);
+	if (texts.length > 0) registerExactOrigin(ctx, nameNode, nameNode.end, texts);
+}
+
+/** The authored attribute name stamped on a token of the call it lowered to. */
+function attrLoweringToken(node, bind) {
+	return inheritOriginLoc(node, bind.nameOrigin ?? null);
+}
+
+/**
+ * The runtime helper an attribute binding lowers to, or `null` for a binding
+ * that is not one attribute's write (children, refs, spreads, the commit-phase
+ * source collectors). Single source of truth for the import the binding needs
+ * and for the token `registerAttrLoweringOrigin` claims; the mount/update cases
+ * call exactly these.
+ */
+function attrBindingHelper(bind) {
+	const controlled = CONTROLLED_KIND_HELPERS[bind.kind];
+	if (controlled !== undefined) return controlled;
+	switch (bind.kind) {
+		case 'attr':
+			return 'setAttribute';
+		case 'stringData':
+			return 'setStringData';
+		case 'booleanAttr':
+			return 'setBooleanAttribute';
+		case 'ariaAttr':
+			return 'setAriaAttribute';
+		case 'formAction':
+			return 'setFormAction';
+		case 'style':
+			return 'setStyle';
+		// SVG/MathML `className` is read-only — setClassAttr sets the attribute and
+		// clsx-composes (setClassName composes on HTML).
+		case 'class':
+			return bind.ns && bind.ns !== 'html' ? 'setClassAttr' : 'setClassName';
+		default:
+			return null;
+	}
+}
+
+/**
  * An ALIAS: an authored range that emits nothing of its own but means the same
  * thing as one that does. A component's closing tag is the case — `</Card>` is
  * pure syntax, while the opening name became the emitted component reference —
@@ -6948,8 +7011,16 @@ function ssrVoid(origin) {
 	return inheritOriginLoc(b.unary('void', b.literal(0)), origin);
 }
 
+/**
+ * `helper` is the runtime alias to call, or a prepared callee node when the
+ * caller already anchored it (see ctlContentCallee) — the alias would otherwise
+ * inherit the element's location like the rest of the call.
+ */
 function ssrCall(helper, args, origin) {
-	return inheritOriginLoc(b.call(`_$${helper}`, ...args), origin);
+	return inheritOriginLoc(
+		b.call(typeof helper === 'string' ? `_$${helper}` : helper, ...args),
+		origin,
+	);
 }
 
 function ssrThunk(expression, origin) {
@@ -6964,11 +7035,45 @@ function ssrSourcePair(present, value, origin) {
 	return inheritOriginLoc(b.array([present, value]), origin);
 }
 
-function ssrDirectSource(name, value, origin) {
+/**
+ * One `[spread, name, value]` source row for a grouped attribute helper. The
+ * name literal is the only token in the group that names THIS attribute, so it
+ * is what the authored name is claimed against (see registerAttrLoweringOrigin);
+ * the helper itself stays anchored on the element it serializes.
+ */
+function ssrDirectSource(ctx, name, value, origin) {
+	registerAttrLoweringOrigin(ctx, origin?.name, null, name);
 	return inheritOriginLoc(
 		b.array([b.literal(false, 'false'), b.literal(name, JSON.stringify(name)), value]),
 		origin,
 	);
+}
+
+/**
+ * `<textarea value>` / `<select value>` put NOTHING in the attribute list: the
+ * whole lowering of `value`/`defaultValue` is the content-position
+ * `ssrTextareaValue(…)` / option-projection `ssrSelectScope(…)` call, which
+ * takes its writers POSITIONALLY. So unlike ssrDirectSource there is no name
+ * literal to claim, and the helper alias is the only token that names what
+ * these attributes became.
+ *
+ * One call serves BOTH writers, and a call carries one location, so `value`
+ * anchors the alias when present (`defaultValue` otherwise) and the other
+ * writer's name aliases onto it — the same split claimCssOrigins makes for
+ * `<style>` blocks sharing one injection, and for the same reason: an exact
+ * claim on an offset the print never emits at would refine nothing.
+ */
+function ctlContentCallee(ctx, helper, origins) {
+	const callee = b.id(`_$${helper}`);
+	const anchor = origins.find((origin) => hasAuthoredOrigin(origin?.name));
+	if (anchor === undefined) return callee;
+	registerAttrLoweringOrigin(ctx, anchor.name, helper, null);
+	for (const origin of origins) {
+		if (origin !== anchor && hasAuthoredOrigin(origin?.name)) {
+			registerOriginAlias(ctx, origin.name, anchor.name);
+		}
+	}
+	return inheritOriginLoc(callee, anchor.name);
 }
 
 function ssrAstCallsAny(root, prefixes) {
@@ -7206,6 +7311,10 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 	// (never an attribute); <option> captures its `value` for the scope compare.
 	let ctlValue = null; // textarea/select captured `value` expr
 	let ctlDefault = null; // textarea/select captured `defaultValue` expr
+	// …and the attributes they came from: the capture discards the authored
+	// names, which the positional content/scope call has to claim (ctlContentCallee).
+	let ctlValueAttr = null;
+	let ctlDefaultAttr = null;
 	let selMultiple = inheritOriginLoc(b.literal(false, 'false'), node); // select `multiple`
 	let optValue = null; // option `value` expr (constant or temp); null = no value attr
 	// TSRX accepts repeated attributes. JSX prop construction is last-writer-wins,
@@ -7440,7 +7549,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 				// ultimately wins over its default. Besides preserving side effects,
 				// this lets spread snapshots run between surrounding direct writers.
 				const tmp = bindAttributeEvaluation(ctlExpr);
-				formControlSources.push(ssrDirectSource(attrName, tmp, attr));
+				formControlSources.push(ssrDirectSource(ctx, attrName, tmp, attr));
 				continue;
 			}
 			// textarea / select: value/defaultValue never serialize as attributes —
@@ -7456,9 +7565,14 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 					formControlPart = parts.length;
 					parts.push('');
 				}
-				formControlSources.push(ssrDirectSource(attrName, ctlExpr, attr));
-			} else if (attrName === 'value') ctlValue = ctlExpr;
-			else ctlDefault = ctlExpr;
+				formControlSources.push(ssrDirectSource(ctx, attrName, ctlExpr, attr));
+			} else if (attrName === 'value') {
+				ctlValue = ctlExpr;
+				ctlValueAttr = attr;
+			} else {
+				ctlDefault = ctlExpr;
+				ctlDefaultAttr = attr;
+			}
 			continue;
 		}
 		if (tag === 'select' && attrName === 'multiple') {
@@ -7475,7 +7589,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 					formControlPart = parts.length;
 					parts.push('');
 				}
-				formControlSources.push(ssrDirectSource('multiple', multipleExpr, attr));
+				formControlSources.push(ssrDirectSource(ctx, 'multiple', multipleExpr, attr));
 				continue;
 			}
 			// Serialize the attribute normally AND capture the value for the
@@ -7500,6 +7614,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 			selMultiple = tmp;
 			flush();
 			ctx.runtimeNeeded.add('ssrAttr');
+			registerAttrLoweringOrigin(ctx, attr.name, 'ssrAttr', 'multiple');
 			parts.push(
 				ssrCall(
 					'ssrAttr',
@@ -7524,7 +7639,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 						? inheritOriginLoc(b.literal(true, 'true'), attr)
 						: tsrxExprNode(oInner, ctx, name, inlinedSubs),
 				);
-				attrSources.push(ssrDirectSource('value', optionExpr, attr));
+				attrSources.push(ssrDirectSource(ctx, 'value', optionExpr, attr));
 				continue;
 			}
 			// The option's value feeds BOTH the attribute and the select-scope
@@ -7548,6 +7663,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 			optValue = tmp;
 			flush();
 			ctx.runtimeNeeded.add('ssrAttr');
+			registerAttrLoweringOrigin(ctx, attr.name, 'ssrAttr', 'value');
 			parts.push(
 				ssrCall(
 					'ssrAttr',
@@ -7575,7 +7691,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 				);
 				attrExpr = tsrxExprNode(attrInner, ctx, name, inlinedSubs);
 			}
-			attrSources.push(ssrDirectSource(rawAttrName, bindAttributeEvaluation(attrExpr), attr));
+			attrSources.push(ssrDirectSource(ctx, rawAttrName, bindAttributeEvaluation(attrExpr), attr));
 			continue;
 		}
 
@@ -7585,6 +7701,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 			if (ctx.dev && needsDevStaticAttrValidation(attrName, true, tag, selfNs)) {
 				flush();
 				ctx.runtimeNeeded.add('ssrAttr');
+				registerAttrLoweringOrigin(ctx, attr.name, 'ssrAttr', attrName);
 				parts.push(
 					ssrCall(
 						'ssrAttr',
@@ -7618,6 +7735,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 			}
 			flush();
 			ctx.runtimeNeeded.add('ssrStyle');
+			registerAttrLoweringOrigin(ctx, attr.name, 'ssrStyle', null);
 			parts.push(
 				ssrCall(
 					'ssrStyle',
@@ -7655,6 +7773,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 			flush();
 			ctx.runtimeNeeded.add('ssrAttr');
 			const outName = tag === 'form' ? 'action' : 'formaction';
+			registerAttrLoweringOrigin(ctx, attr.name, 'ssrAttr', outName);
 			const valueExpr = bindAttributeEvaluation(tsrxExprNode(inner, ctx, name, inlinedSubs));
 			const filteredValue = inheritOriginLoc(
 				b.call(
@@ -7688,6 +7807,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 		// Dynamic attribute (or literal after a spread).
 		flush();
 		ctx.runtimeNeeded.add('ssrAttr');
+		registerAttrLoweringOrigin(ctx, attr.name, 'ssrAttr', attrName);
 		const valueExpr = bindAttributeEvaluation(tsrxExprNode(inner, ctx, name, inlinedSubs));
 		parts.push(
 			ssrCall(
@@ -7874,7 +7994,11 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 			b.conditional(
 				b.binary('==', src, b.literal(null)),
 				childrenExpr,
-				ssrCall('ssrTextareaValue', [src], node),
+				ssrCall(
+					ctlContentCallee(ctx, 'ssrTextareaValue', [ctlValueAttr, ctlDefaultAttr]),
+					[src],
+					node,
+				),
 			),
 			node,
 		);
@@ -7893,7 +8017,7 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 	} else if (tag === 'select' && (ctlValue !== null || ctlDefault !== null)) {
 		ctx.runtimeNeeded.add('ssrSelectScope');
 		childrenExpr = ssrCall(
-			'ssrSelectScope',
+			ctlContentCallee(ctx, 'ssrSelectScope', [ctlValueAttr, ctlDefaultAttr]),
 			[
 				ctlValue ?? ssrVoid(node),
 				ctlDefault ?? ssrVoid(node),
@@ -15037,28 +15161,30 @@ function planJsx(
 		if (b.kind === 'text' || b.kind === 'textOnlyChild') ctx.runtimeNeeded.add('setText');
 		if (b.kind === 'text') ctx.runtimeNeeded.add('htextSwap');
 		if (b.kind === 'textOnlyChild') ctx.runtimeNeeded.add('htext');
-		if (b.kind === 'attr') ctx.runtimeNeeded.add('setAttribute');
-		if (b.kind === 'stringData') ctx.runtimeNeeded.add('setStringData');
-		if (b.kind === 'booleanAttr') ctx.runtimeNeeded.add('setBooleanAttribute');
-		if (b.kind === 'ariaAttr') ctx.runtimeNeeded.add('setAriaAttribute');
-		if (CONTROLLED_KIND_HELPERS[b.kind] !== undefined) {
-			ctx.runtimeNeeded.add(CONTROLLED_KIND_HELPERS[b.kind]);
+		// One resolution for both consumers: the import this binding needs, and
+		// the token the authored attribute name is claimed against.
+		const attrHelper = attrBindingHelper(b);
+		if (attrHelper !== null) {
+			ctx.runtimeNeeded.add(attrHelper);
+			registerAttrLoweringOrigin(ctx, b.nameOrigin, attrHelper, b.name);
 		}
-		if (b.kind === 'class') {
-			if (b.ns && b.ns !== 'html') {
-				// SVG/MathML `className` is read-only — use setClassAttr, which sets the
-				// attribute + clsx-composes (setClassName handles composition on HTML).
-				ctx.runtimeNeeded.add('setClassAttr');
-			} else ctx.runtimeNeeded.add('setClassName');
-		}
-		if (b.kind === 'style') ctx.runtimeNeeded.add('setStyle');
-		if (b.kind === 'formAction') ctx.runtimeNeeded.add('setFormAction');
 		if (b.kind === 'htmlOnlyChild') ctx.runtimeNeeded.add('setDangerouslySetInnerHTML');
 		if (b.kind === 'dangerCommit') ctx.runtimeNeeded.add('setDangerouslySetInnerHTMLSources');
 		if (b.kind === 'formCommit') ctx.runtimeNeeded.add('setFormControlSources');
 		if (b.kind === 'hostCommit') {
 			ctx.runtimeNeeded.add('setHostPropSources');
 			ctx.runtimeNeeded.add('queueRefDetach');
+		}
+		// A commit-phase collector takes the element's props as one grouped call,
+		// so each source's name literal — not the shared helper — is what claims
+		// that attribute's name (see commitSourceRows). Registered once here; the
+		// literal carries the same authored location on the update path.
+		if (b.kind === 'hostCommit' || b.kind === 'formCommit') {
+			for (const source of b.sources) {
+				if (source.spread !== true) {
+					registerAttrLoweringOrigin(ctx, source.nameOrigin, null, source.name);
+				}
+			}
 		}
 		if (b.kind === 'dangerChild') ctx.runtimeNeeded.add('markDangerouslySetInnerHTMLChildren');
 		if (b.kind === 'nativeChangeStatic') {
@@ -16204,6 +16330,33 @@ function cleanupsPush(fnNode) {
 	return b.stmt(b.call(b.member(lazyArray, 'push'), fnNode));
 }
 
+/**
+ * The `[spread, name, value]` rows a commit-phase source collector
+ * (`setHostPropSources` / `setFormControlSources`) resolves in authored order.
+ * Shared by the mount and update emits, which differ only in how a source's
+ * value is read back — a bag local at mount, a bag field on update.
+ *
+ * Each name literal is the one token in the group that names ITS attribute, so
+ * it carries the authored name rather than the element's location (the same
+ * split ssrDirectSource makes on the server); the collector itself serializes
+ * every source of the element and stays anchored there. Nothing else in a row
+ * reproduces the authored name — the value is the prop's expression — so
+ * without this the whole group answered only for the element.
+ */
+function commitSourceRows(sources, valueOf) {
+	return b.array(
+		sources.map(({ spread, name, nameOrigin, binding }) =>
+			spread
+				? b.array([b.literal(true), valueOf(binding, true)])
+				: b.array([
+						b.literal(false),
+						inheritOriginLoc(b.literal(name), nameOrigin ?? null),
+						valueOf(binding, false),
+					]),
+		),
+	);
+}
+
 // Mount for a DEFERRED property-write binding: store the element ref + seed the
 // diff field to `undefined`. The every-render diff then performs the actual
 // write — including on the first render, since the `undefined` seed makes its
@@ -16235,6 +16388,10 @@ function emitBindingMount(bind, elVar, bag) {
 	const el = () => hostVarNode(elVar);
 	const local = (key) => b.id(bag.local(key));
 	const V = () => b.id('_v');
+	// The tokens that NAME this binding's lowering carry the authored attribute
+	// name; everything else in the call maps to the value expression.
+	const callee = () => attrLoweringToken(b.id(`_$${attrBindingHelper(bind)}`), bind);
+	const nameLit = () => attrLoweringToken(b.literal(bind.name), bind);
 	// `suppressHydrationWarning`: stamp a JS flag (NOT a DOM attribute) the runtime reads to
 	// keep the server value + skip the warning on a hydration mismatch for this element.
 	if (bind.kind === 'suppress') {
@@ -16306,13 +16463,8 @@ function emitBindingMount(bind, elVar, bag) {
 			);
 		}
 		case 'formCommit': {
-			const sources = b.array(
-				bind.sources.map(({ spread, name, binding }) => {
-					const value = b.id(bag.local(`${spread ? '_sp' : '_prev'}$${binding.id}`));
-					return spread
-						? b.array([b.literal(true), value])
-						: b.array([b.literal(false), b.literal(name), value]);
-				}),
+			const sources = commitSourceRows(bind.sources, (binding, spread) =>
+				b.id(bag.local(`${spread ? '_sp' : '_prev'}$${binding.id}`)),
 			);
 			return st(
 				b.block([
@@ -16324,13 +16476,8 @@ function emitBindingMount(bind, elVar, bag) {
 		case 'hostCommit': {
 			const elLocal = local(`_el$${bind.id}`);
 			const propsLocal = local(`_host$${bind.id}`);
-			const sources = b.array(
-				bind.sources.map(({ spread, name, binding }) => {
-					const value = b.id(bag.local(`${spread ? '_sp' : '_prev'}$${binding.id}`));
-					return spread
-						? b.array([b.literal(true), value])
-						: b.array([b.literal(false), b.literal(name), value]);
-				}),
+			const sources = commitSourceRows(bind.sources, (binding, spread) =>
+				b.id(bag.local(`${spread ? '_sp' : '_prev'}$${binding.id}`)),
 			);
 			// The cleanup closure reads the bag through the captured `_b` — the bag
 			// exists by the time any cleanup runs (committed at mount end), and the
@@ -16397,16 +16544,10 @@ function emitBindingMount(bind, elVar, bag) {
 		case 'stringData':
 		case 'booleanAttr':
 		case 'ariaAttr': {
-			const helper = {
-				attr: '_$setAttribute',
-				stringData: '_$setStringData',
-				booleanAttr: '_$setBooleanAttribute',
-				ariaAttr: '_$setAriaAttribute',
-			}[bind.kind];
 			return st(
 				b.block([
 					b.const('_v', bind.expr),
-					b.stmt(b.call(helper, el(), b.literal(bind.name), V())),
+					b.stmt(b.call(callee(), el(), nameLit(), V())),
 					b.stmt(b.assignment('=', local(`_el$${bind.id}`), el())),
 					b.stmt(b.assignment('=', local(`_prev$${bind.id}`), V())),
 				]),
@@ -16426,7 +16567,7 @@ function emitBindingMount(bind, elVar, bag) {
 			// runs inside the hydration window and arms the element.
 			return st(
 				b.block([
-					b.stmt(b.call(`_$${CONTROLLED_KIND_HELPERS[bind.kind]}`, el(), bind.expr)),
+					b.stmt(b.call(callee(), el(), bind.expr)),
 					b.stmt(b.assignment('=', local(`_el$${bind.id}`), el())),
 				]),
 			);
@@ -16434,15 +16575,14 @@ function emitBindingMount(bind, elVar, bag) {
 		case 'autoFocus': {
 			// Mount-only (React ignores later autoFocus changes); the focus
 			// itself fires at commit, after the tree is connected.
-			return st(b.stmt(b.call('_$setAutoFocus', el(), bind.expr)));
+			return st(b.stmt(b.call(callee(), el(), bind.expr)));
 		}
 		case 'class': {
 			// On SVG/MathML hosts the `className` property is read-only — fall back
 			// to setAttribute. Compile-time choice, zero runtime branching.
-			const setter = bind.ns && bind.ns !== 'html' ? '_$setClassAttr' : '_$setClassName';
 			const body = [
 				b.const('_v', bind.expr),
-				b.stmt(b.call(setter, el(), V())),
+				b.stmt(b.call(callee(), el(), V())),
 				b.stmt(b.assignment('=', local(`_el$${bind.id}`), el())),
 			];
 			if (!bind.fresh) body.push(b.stmt(b.assignment('=', local(`_prev$${bind.id}`), V())));
@@ -16452,7 +16592,7 @@ function emitBindingMount(bind, elVar, bag) {
 			return st(
 				b.block([
 					b.const('_v', bind.expr),
-					b.stmt(b.call('_$setStyle', el(), V(), undefinedNode())),
+					b.stmt(b.call(callee(), el(), V(), undefinedNode())),
 					b.stmt(b.assignment('=', local(`_el$${bind.id}`), el())),
 					b.stmt(b.assignment('=', local(`_sty$${bind.id}`), V())),
 				]),
@@ -16526,7 +16666,7 @@ function emitBindingMount(bind, elVar, bag) {
 			return st(
 				b.block([
 					b.const('_v', bind.expr),
-					b.stmt(b.call('_$setFormAction', el(), b.literal(bind.name), V(), undefinedNode())),
+					b.stmt(b.call(callee(), el(), nameLit(), V(), undefinedNode())),
 					b.stmt(b.assignment('=', local(`_el$${bind.id}`), el())),
 					b.stmt(b.assignment('=', local(`_prev$${bind.id}`), V())),
 				]),
@@ -16628,6 +16768,10 @@ function emitBindingUpdate(bind, bag) {
 	// 1-char bag field names (see makeBag) — resolved from the same registry the
 	// mount pass registered them in; an unmounted field throws at compile time.
 	const F = (prefix) => bagFieldNode(bag, `${prefix}$${bind.id}`);
+	// See emitBindingMount: the helper and the name literal carry the authored
+	// attribute name, so the name resolves to the update write too.
+	const callee = () => attrLoweringToken(b.id(`_$${attrBindingHelper(bind)}`), bind);
+	const nameLit = () => attrLoweringToken(b.literal(bind.name), bind);
 	switch (bind.kind) {
 		case 'nativeChangeRuntime': {
 			return st(b.stmt(b.call('_$queueNativeChangeDiagnostic', F('_el'))));
@@ -16689,24 +16833,14 @@ function emitBindingUpdate(bind, bag) {
 			return st(b.stmt(b.call('_$setDangerouslySetInnerHTMLSources', F('_el'), sources)));
 		}
 		case 'formCommit': {
-			const sources = b.array(
-				bind.sources.map(({ spread, name, binding }) => {
-					const value = bagFieldNode(bag, `${spread ? '_sp' : '_prev'}$${binding.id}`);
-					return spread
-						? b.array([b.literal(true), value])
-						: b.array([b.literal(false), b.literal(name), value]);
-				}),
+			const sources = commitSourceRows(bind.sources, (binding, spread) =>
+				bagFieldNode(bag, `${spread ? '_sp' : '_prev'}$${binding.id}`),
 			);
 			return st(b.stmt(b.call('_$setFormControlSources', F('_el'), sources)));
 		}
 		case 'hostCommit': {
-			const sources = b.array(
-				bind.sources.map(({ spread, name, binding }) => {
-					const value = bagFieldNode(bag, `${spread ? '_sp' : '_prev'}$${binding.id}`);
-					return spread
-						? b.array([b.literal(true), value])
-						: b.array([b.literal(false), b.literal(name), value]);
-				}),
+			const sources = commitSourceRows(bind.sources, (binding, spread) =>
+				bagFieldNode(bag, `${spread ? '_sp' : '_prev'}$${binding.id}`),
 			);
 			return st(
 				b.stmt(
@@ -16729,19 +16863,13 @@ function emitBindingUpdate(bind, bag) {
 		case 'stringData':
 		case 'booleanAttr':
 		case 'ariaAttr': {
-			const helper = {
-				attr: '_$setAttribute',
-				stringData: '_$setStringData',
-				booleanAttr: '_$setBooleanAttribute',
-				ariaAttr: '_$setAriaAttribute',
-			}[bind.kind];
 			return st(
 				b.block([
 					b.const('_v', bind.expr),
 					b.if(
 						b.binary('!==', F('_prev'), V()),
 						b.block([
-							b.stmt(b.call(helper, F('_el'), b.literal(bind.name), V())),
+							b.stmt(b.call(callee(), F('_el'), nameLit(), V())),
 							b.stmt(b.assignment('=', F('_prev'), V())),
 						]),
 						null,
@@ -16760,12 +16888,11 @@ function emitBindingUpdate(bind, bag) {
 			// reasserts on every commit — the helper's DOM-diff makes an
 			// unchanged value free, and a prev-guard would skip exactly the
 			// "unrelated re-render while the DOM drifted" reassert case.
-			return st(b.stmt(b.call(`_$${CONTROLLED_KIND_HELPERS[bind.kind]}`, F('_el'), bind.expr)));
+			return st(b.stmt(b.call(callee(), F('_el'), bind.expr)));
 		}
 		case 'class': {
-			const setter = bind.ns && bind.ns !== 'html' ? '_$setClassAttr' : '_$setClassName';
 			if (bind.fresh) {
-				return st(b.stmt(b.call(setter, F('_el'), bind.expr)));
+				return st(b.stmt(b.call(callee(), F('_el'), bind.expr)));
 			}
 			return st(
 				b.block([
@@ -16773,7 +16900,7 @@ function emitBindingUpdate(bind, bag) {
 					b.if(
 						b.binary('!==', F('_prev'), V()),
 						b.block([
-							b.stmt(b.call(setter, F('_el'), V())),
+							b.stmt(b.call(callee(), F('_el'), V())),
 							b.stmt(b.assignment('=', F('_prev'), V())),
 						]),
 						null,
@@ -16791,7 +16918,7 @@ function emitBindingUpdate(bind, bag) {
 					b.if(
 						b.binary('!==', F('_sty'), V()),
 						b.block([
-							b.stmt(b.call('_$setStyle', F('_el'), V(), F('_sty'))),
+							b.stmt(b.call(callee(), F('_el'), V(), F('_sty'))),
 							b.stmt(b.assignment('=', F('_sty'), V())),
 						]),
 						null,
@@ -16838,7 +16965,7 @@ function emitBindingUpdate(bind, bag) {
 					b.if(
 						b.binary('!==', F('_prev'), V()),
 						b.block([
-							b.stmt(b.call('_$setFormAction', F('_el'), b.literal(bind.name), V(), F('_prev'))),
+							b.stmt(b.call(callee(), F('_el'), nameLit(), V(), F('_prev'))),
 							b.stmt(b.assignment('=', F('_prev'), V())),
 						]),
 						null,
@@ -17566,7 +17693,12 @@ function emitElementHtml(
 				path,
 			};
 			bindings.push(binding);
-			hostClientSources.push({ spread: false, name: rawAttrName, binding });
+			hostClientSources.push({
+				spread: false,
+				name: rawAttrName,
+				nameOrigin: attr.name,
+				binding,
+			});
 			continue;
 		}
 		// `key` on a regular element:
@@ -17614,6 +17746,7 @@ function emitElementHtml(
 							),
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 			continue;
 		}
@@ -17717,6 +17850,7 @@ function emitElementHtml(
 				expr,
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 			continue;
 		}
@@ -17745,7 +17879,12 @@ function emitElementHtml(
 				path,
 			};
 			bindings.push(binding);
-			formControlClientSources.push({ spread: false, name: attrName, binding });
+			formControlClientSources.push({
+				spread: false,
+				name: attrName,
+				nameOrigin: attr.name,
+				binding,
+			});
 			continue;
 		}
 		if (ctlKind !== null) {
@@ -17768,6 +17907,7 @@ function emitElementHtml(
 							),
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 			continue;
 		}
@@ -17791,6 +17931,7 @@ function emitElementHtml(
 							),
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 			continue;
 		}
@@ -17842,6 +17983,7 @@ function emitElementHtml(
 				expr: tsrxExprNode(inner, ctx, componentName, inlinedSubs),
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 			continue;
 		}
@@ -17935,6 +18077,7 @@ function emitElementHtml(
 				path,
 				ns: hostNs,
 				fresh: isFreshBindingExpr(inner),
+				nameOrigin: attr.name,
 			});
 		} else if (
 			(tag === 'form' && attrName === 'action') ||
@@ -17953,6 +18096,7 @@ function emitElementHtml(
 				expr,
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 		} else if (/^aria-[a-z][a-z0-9_-]*$/.test(attrName)) {
 			// Statically named lowercase ARIA attributes bypass the generic alias,
@@ -17966,6 +18110,7 @@ function emitElementHtml(
 				expr,
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 		} else if (
 			!((hostNs === 'html' || hostNs === 'opaque') && tag.includes('-')) &&
@@ -17981,6 +18126,7 @@ function emitElementHtml(
 				expr,
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 		} else if (
 			/^data-[a-z][a-z0-9_-]*$/.test(attrName) &&
@@ -17999,6 +18145,7 @@ function emitElementHtml(
 				expr,
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 		} else {
 			bindings.push({
@@ -18008,6 +18155,7 @@ function emitElementHtml(
 				expr,
 				path,
 				ns: hostNs,
+				nameOrigin: attr.name,
 			});
 		}
 	}
