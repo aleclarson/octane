@@ -1,5 +1,12 @@
 # @octanejs/tanstack-devtools
 
+## 0.0.12
+
+### Patch Changes
+
+- Updated dependencies [50c1ab5]
+  - octane@0.1.18
+
 ## 0.0.11
 
 ### Patch Changes

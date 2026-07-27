@@ -1,5 +1,15 @@
 # @octanejs/shadcn
 
+## 0.0.3
+
+### Patch Changes
+
+- Updated dependencies [50c1ab5]
+  - octane@0.1.18
+  - @octanejs/lucide@0.1.13
+  - @octanejs/radix@0.1.17
+  - @octanejs/sonner@0.1.13
+
 ## 0.0.2
 
 ### Patch Changes

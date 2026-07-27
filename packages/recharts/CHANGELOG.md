@@ -1,5 +1,13 @@
 # @octanejs/recharts
 
+## 0.1.15
+
+### Patch Changes
+
+- Updated dependencies [50c1ab5]
+  - octane@0.1.18
+  - @octanejs/redux@0.1.15
+
 ## 0.1.14
 
 ### Patch Changes
