@@ -32,6 +32,7 @@ packages:
   - benchmarks/ssr-workerd
   - benchmarks/ssr-workerd/*
   - benchmarks/codegen-size
+  - benchmarks/cpu-work-isolation
   - benchmarks/lynx-render
   - benchmarks/lynx-list
   - benchmarks/lynx-table
