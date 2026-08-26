@@ -1,0 +1,20 @@
+{
+  "name": "octane-component-auto-memo-benchmark",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "vite --host --port 5317 --strictPort",
+    "build": "vite build",
+    "preview": "vite preview --port 5317 --strictPort",
+    "typecheck": "tsrx-tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "octane": "workspace:*"
+  },
+  "devDependencies": {
+    "@tsrx/typescript-plugin": "catalog:default",
+    "typescript": "catalog:default",
+    "vite": "catalog:default"
+  }
+}

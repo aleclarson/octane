@@ -1,0 +1,18 @@
+{
+  "include": ["src/**/*", "vite.config.ts"],
+  "compilerOptions": {
+    "strict": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["DOM", "DOM.Iterable", "ES2024"],
+    "target": "ES2024",
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "octane",
+    "plugins": [
+      {
+        "name": "@tsrx/typescript-plugin"
+      }
+    ]
+  }
+}
