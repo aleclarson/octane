@@ -10,6 +10,21 @@ const ITEMS = Array.from({ length: ITEM_COUNT }, (_, id) => id + 1);
 
 interface ListProps {
 	items: number[];
+	seed: number;
+}
+
+type CaseKey =
+	| 'inlineDeterministic'
+	| 'normalDeterministic'
+	| 'memoDeterministic'
+	| 'inlineRandom'
+	| 'normalRandom'
+	| 'memoRandom';
+
+interface CaseDefinition {
+	Component: ComponentBody<ListProps>;
+	key: CaseKey;
+	label: string;
 }
 
 let heavyCallCount = 0;
@@ -34,18 +49,85 @@ function InlineList(props: ListProps) @{
 	</ul>
 }
 
+function InlineRandomSeedList(props: ListProps) @{
+	<ul>
+		@for (const item of props.items; key item) {
+			<li data-item={item}>{'' + heavyCpuWork(item ^ props.seed)}</li>
+		}
+	</ul>
+}
+
 function HeavyItem(props: { item: number }) @{
 	const result = '' + heavyCpuWork(props.item);
 	<li data-item={props.item}>{result}</li>
 }
 const IsolatedHeavyItem = memo(HeavyItem);
 
-function IsolatedList(props: ListProps) @{
+function RandomSeedHeavyItem(props: { item: number; seed: number }) @{
+	const result = '' + heavyCpuWork(props.item ^ props.seed);
+	<li data-item={props.item}>{result}</li>
+}
+const IsolatedRandomSeedHeavyItem = memo(RandomSeedHeavyItem);
+
+function NormalComponentList(props: ListProps) @{
+	<ul>
+		@for (const item of props.items; key item) {
+			<HeavyItem item={item} />
+		}
+	</ul>
+}
+
+function MemoComponentList(props: ListProps) @{
 	<ul>
 		@for (const item of props.items; key item) {
 			<IsolatedHeavyItem item={item} />
 		}
 	</ul>
+}
+
+function NormalRandomSeedComponentList(props: ListProps) @{
+	<ul>
+		@for (const item of props.items; key item) {
+			<RandomSeedHeavyItem item={item} seed={props.seed} />
+		}
+	</ul>
+}
+
+function MemoRandomSeedComponentList(props: ListProps) @{
+	<ul>
+		@for (const item of props.items; key item) {
+			<IsolatedRandomSeedHeavyItem item={item} seed={props.seed} />
+		}
+	</ul>
+}
+
+const CASES: CaseDefinition[] = [
+	{ key: 'inlineDeterministic', label: 'Inline @for, deterministic', Component: InlineList },
+	{
+		key: 'normalDeterministic',
+		label: 'Normal component, deterministic',
+		Component: NormalComponentList,
+	},
+	{
+		key: 'memoDeterministic',
+		label: 'Memo component, deterministic',
+		Component: MemoComponentList,
+	},
+	{ key: 'inlineRandom', label: 'Inline @for, random seed', Component: InlineRandomSeedList },
+	{
+		key: 'normalRandom',
+		label: 'Normal component, random seed',
+		Component: NormalRandomSeedComponentList,
+	},
+	{
+		key: 'memoRandom',
+		label: 'Memo component, random seed',
+		Component: MemoRandomSeedComponentList,
+	},
+];
+
+function randomSeed(): number {
+	return Math.random() * 0x1_0000_0000 >>> 0;
 }
 
 function median(values: number[]): number {
@@ -58,7 +140,7 @@ function measureMount(host: HTMLElement, Component: ComponentBody<ListProps>): n
 	const root = createRoot(host);
 	const callsBefore = heavyCallCount;
 	const startedAt = performance.now();
-	root.render(Component, { items: ITEMS });
+	root.render(Component, { items: ITEMS, seed: randomSeed() });
 	const elapsed = performance.now() - startedAt;
 
 	if (
@@ -75,27 +157,38 @@ function formatSamples(samples: number[]): string {
 	return samples.map((sample) => sample.toFixed(2)).join(', ');
 }
 
-interface UpdateSamples {
-	inlineCalls: number[];
-	inlineTimes: number[];
-	isolatedCalls: number[];
-	isolatedTimes: number[];
+interface CaseSamples {
+	calls: number[];
+	times: number[];
 }
 
-function shiftedArrays(items: number[]): number[][] {
-	const arrays = new Array<number[]>(UPDATES_PER_SAMPLE);
+type BenchmarkSamples = Record<CaseKey, CaseSamples>;
+
+function createSamples(): BenchmarkSamples {
+	return {
+		inlineDeterministic: { calls: [], times: [] },
+		normalDeterministic: { calls: [], times: [] },
+		memoDeterministic: { calls: [], times: [] },
+		inlineRandom: { calls: [], times: [] },
+		normalRandom: { calls: [], times: [] },
+		memoRandom: { calls: [], times: [] },
+	};
+}
+
+function shiftedRenders(items: number[]): ListProps[] {
+	const renders = new Array<ListProps>(UPDATES_PER_SAMPLE);
 	let next = items;
 	for (let i = 0; i < UPDATES_PER_SAMPLE; i++) {
 		next = [...next.slice(1), next[0]];
-		arrays[i] = next;
+		renders[i] = { items: next, seed: randomSeed() };
 	}
-	return arrays;
+	return renders;
 }
 
-function measureUpdateBatch(render: (items: number[]) => void, arrays: number[][]) {
+function measureUpdateBatch(render: (props: ListProps) => void, renders: ListProps[]) {
 	const callsBefore = heavyCallCount;
 	const startedAt = performance.now();
-	for (const items of arrays) render(items);
+	for (const props of renders) render(props);
 	return {
 		calls: (heavyCallCount - callsBefore) / UPDATES_PER_SAMPLE,
 		elapsed: (performance.now() - startedAt) / UPDATES_PER_SAMPLE,
@@ -115,68 +208,53 @@ function validateOrder(host: HTMLElement, items: number[]): void {
 	}
 }
 
-function measureUpdates(host: HTMLElement): UpdateSamples {
-	const inlineHost = document.createElement('div');
-	const isolatedHost = document.createElement('div');
-	host.append(inlineHost, isolatedHost);
+interface UpdateState {
+	definition: CaseDefinition;
+	host: HTMLElement;
+	items: number[];
+	root: ReturnType<typeof createRoot>;
+}
 
-	const inlineRoot = createRoot(inlineHost);
-	const isolatedRoot = createRoot(isolatedHost);
-	let inlineItems = ITEMS;
-	let isolatedItems = ITEMS;
-	inlineRoot.render(InlineList, { items: inlineItems });
-	isolatedRoot.render(IsolatedList, { items: isolatedItems });
+function forEachRotatedCase(offset: number, visit: (definition: CaseDefinition) => void): void {
+	for (let i = 0; i < CASES.length; i++) visit(CASES[(i + offset) % CASES.length]);
+}
 
-	const samples: UpdateSamples = {
-		inlineCalls: [],
-		inlineTimes: [],
-		isolatedCalls: [],
-		isolatedTimes: [],
-	};
+function measureUpdates(host: HTMLElement): BenchmarkSamples {
+	const states = new Map<CaseKey, UpdateState>();
+	for (const definition of CASES) {
+		const caseHost = document.createElement('div');
+		host.append(caseHost);
+		const root = createRoot(caseHost);
+		root.render(definition.Component, { items: ITEMS, seed: randomSeed() });
+		states.set(definition.key, { definition, host: caseHost, items: ITEMS, root });
+	}
 
-	const updateInline = (record: boolean) => {
-		const arrays = shiftedArrays(inlineItems);
+	const samples = createSamples();
+	const update = (definition: CaseDefinition, record: boolean) => {
+		const state = states.get(definition.key)!;
+		const renders = shiftedRenders(state.items);
 		const sample = measureUpdateBatch(
-			(items) => flushSync(() => inlineRoot.render(InlineList, { items })),
-			arrays,
+			(props) => flushSync(() => state.root.render(definition.Component, props)),
+			renders,
 		);
-		inlineItems = arrays[arrays.length - 1];
+		state.items = renders[renders.length - 1].items;
 		if (record) {
-			samples.inlineCalls.push(sample.calls);
-			samples.inlineTimes.push(sample.elapsed);
-		}
-	};
-	const updateIsolated = (record: boolean) => {
-		const arrays = shiftedArrays(isolatedItems);
-		const sample = measureUpdateBatch(
-			(items) => flushSync(() => isolatedRoot.render(IsolatedList, { items })),
-			arrays,
-		);
-		isolatedItems = arrays[arrays.length - 1];
-		if (record) {
-			samples.isolatedCalls.push(sample.calls);
-			samples.isolatedTimes.push(sample.elapsed);
+			samples[definition.key].calls.push(sample.calls);
+			samples[definition.key].times.push(sample.elapsed);
 		}
 	};
 
 	for (let i = 0; i < WARMUP_RUNS; i++) {
-		updateInline(false);
-		updateIsolated(false);
+		forEachRotatedCase(i, (definition) => update(definition, false));
 	}
 	for (let i = 0; i < UPDATE_SAMPLES; i++) {
-		if ((i & 1) === 0) {
-			updateInline(true);
-			updateIsolated(true);
-		} else {
-			updateIsolated(true);
-			updateInline(true);
-		}
+		forEachRotatedCase(i, (definition) => update(definition, true));
 	}
 
-	validateOrder(inlineHost, inlineItems);
-	validateOrder(isolatedHost, isolatedItems);
-	inlineRoot.unmount();
-	isolatedRoot.unmount();
+	for (const state of states.values()) {
+		validateOrder(state.host, state.items);
+		state.root.unmount();
+	}
 	return samples;
 }
 
@@ -189,44 +267,44 @@ async function runBenchmark(): Promise<void> {
 	await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 
 	for (let i = 0; i < WARMUP_RUNS; i++) {
-		measureMount(host, InlineList);
-		measureMount(host, IsolatedList);
+		forEachRotatedCase(i, (definition) => measureMount(host, definition.Component));
 	}
 
-	const inline: number[] = [];
-	const isolated: number[] = [];
+	const mounts = createSamples();
 	for (let i = 0; i < MEASURED_RUNS; i++) {
-		// Alternate first position so one case does not always get the warmer CPU.
-		if ((i & 1) === 0) {
-			inline.push(measureMount(host, InlineList));
-			isolated.push(measureMount(host, IsolatedList));
-		} else {
-			isolated.push(measureMount(host, IsolatedList));
-			inline.push(measureMount(host, InlineList));
-		}
+		forEachRotatedCase(i, (definition) => {
+			mounts[definition.key].times.push(measureMount(host, definition.Component));
+		});
 	}
 	const updates = measureUpdates(host);
-	const inlineUpdateMedian = median(updates.inlineTimes);
-	const isolatedUpdateMedian = median(updates.isolatedTimes);
 
-	output.textContent = [
-		'Mount',
-		`Inline @for median: ${median(inline).toFixed(2)} ms`,
-		`Isolated memo component median: ${median(isolated).toFixed(2)} ms`,
+	const lines = ['Mount'];
+	for (const definition of CASES) {
+		lines.push(`${definition.label}: ${median(mounts[definition.key].times).toFixed(2)} ms`);
+	}
+	lines.push('', 'Shift first item to end');
+	for (const definition of CASES) {
+		const samples = updates[definition.key];
+		lines.push(
+			`${definition.label}: ${median(samples.times).toFixed(2)} ms/update, ` +
+				`${median(samples.calls).toFixed(0)} heavy calls/update`,
+		);
+	}
+	lines.push(
 		'',
-		`Inline samples: ${formatSamples(inline)} ms`,
-		`Isolated samples: ${formatSamples(isolated)} ms`,
+		`Random / deterministic inline: ${(median(updates.inlineRandom.times) /
+			median(updates.inlineDeterministic.times)).toFixed(2)}x`,
+		`Random / deterministic normal component: ${(median(updates.normalRandom.times) /
+			median(updates.normalDeterministic.times)).toFixed(2)}x`,
+		`Random / deterministic memo component: ${(median(updates.memoRandom.times) /
+			median(updates.memoDeterministic.times)).toFixed(2)}x`,
 		'',
-		'Shift first item to end',
-		`Inline @for median: ${median(updates.inlineTimes).toFixed(2)} ms/update`,
-		`Isolated memo component median: ${median(updates.isolatedTimes).toFixed(2)} ms/update`,
-		`Memo isolation speedup: ${(inlineUpdateMedian / isolatedUpdateMedian).toFixed(1)}x`,
-		`Inline heavy calls: ${median(updates.inlineCalls).toFixed(0)}/update`,
-		`Isolated memo heavy calls: ${median(updates.isolatedCalls).toFixed(0)}/update`,
-		'',
-		`Inline update samples: ${formatSamples(updates.inlineTimes)} ms`,
-		`Isolated update samples: ${formatSamples(updates.isolatedTimes)} ms`,
-	].join('\n');
+		'Update samples',
+	);
+	for (const definition of CASES) {
+		lines.push(`${definition.label}: ${formatSamples(updates[definition.key].times)} ms`);
+	}
+	output.textContent = lines.join('\n');
 }
 
 function App() @{
@@ -236,7 +314,7 @@ function App() @{
 			{'Each fresh mount renders ' + ITEM_COUNT +
 				' items and runs the same CPU function once per item.'}
 		</p>
-		<p>Updates move the first keyed item to the end on every render.</p>
+		<p>Updates move the first keyed item to the end and give seeded cases a new random seed.</p>
 		<button onClick={runBenchmark}>Run benchmark</button>
 		<pre id="results">Press the button to run.</pre>
 		<div id="benchmark-host" hidden></div>

@@ -1,9 +1,10 @@
 # CPU work isolation
 
-This small browser benchmark compares two Octane list shapes over the same
-2,000-item array. One calls the CPU-heavy function directly inside `@for`; the
-other calls it from a memoized `HeavyItem` component. It measures fresh mounts
-and keyed updates that move the first array item to the end on every render.
+This small browser benchmark compares six Octane list shapes over the same
+2,000-item array: inline `@for` work, a normal child component, and a memoized
+child component, each with deterministic input and with a new random seed on
+every render. It measures fresh mounts and keyed updates that move the first
+array item to the end.
 
 ```bash
 pnpm --dir benchmarks/cpu-work-isolation dev
