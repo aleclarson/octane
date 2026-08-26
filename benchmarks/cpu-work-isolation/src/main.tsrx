@@ -27,15 +27,15 @@ interface CaseDefinition {
 	label: string;
 }
 
-let heavyCallCount = 0;
+// Use a bare callee instead of a member call to isolate the compiler's purity analysis.
+const { imul } = Math;
 
 // Integer arithmetic keeps the workload deterministic and prevents a browser
 // from replacing the loop with a platform math call.
 function heavyCpuWork(value: number): number {
-	heavyCallCount++;
 	let hash = value | 0;
 	for (let i = 0; i < WORK_PER_ITEM; i++) {
-		hash = Math.imul(hash ^ i, 0x45d9f3b);
+		hash = imul(hash ^ i, 0x45d9f3b);
 		hash = hash << 13 | hash >>> 19;
 	}
 	return hash >>> 0;
@@ -138,15 +138,12 @@ function median(values: number[]): number {
 
 function measureMount(host: HTMLElement, Component: ComponentBody<ListProps>): number {
 	const root = createRoot(host);
-	const callsBefore = heavyCallCount;
 	const startedAt = performance.now();
 	root.render(Component, { items: ITEMS, seed: randomSeed() });
 	const elapsed = performance.now() - startedAt;
 
-	if (
-		heavyCallCount - callsBefore !== ITEM_COUNT || host.querySelectorAll('li').length !== ITEM_COUNT
-	) {
-		throw new Error('benchmark did not render and compute every item');
+	if (host.querySelectorAll('li').length !== ITEM_COUNT) {
+		throw new Error('benchmark did not render every item');
 	}
 
 	root.unmount();
@@ -158,7 +155,6 @@ function formatSamples(samples: number[]): string {
 }
 
 interface CaseSamples {
-	calls: number[];
 	times: number[];
 }
 
@@ -166,12 +162,12 @@ type BenchmarkSamples = Record<CaseKey, CaseSamples>;
 
 function createSamples(): BenchmarkSamples {
 	return {
-		inlineDeterministic: { calls: [], times: [] },
-		normalDeterministic: { calls: [], times: [] },
-		memoDeterministic: { calls: [], times: [] },
-		inlineRandom: { calls: [], times: [] },
-		normalRandom: { calls: [], times: [] },
-		memoRandom: { calls: [], times: [] },
+		inlineDeterministic: { times: [] },
+		normalDeterministic: { times: [] },
+		memoDeterministic: { times: [] },
+		inlineRandom: { times: [] },
+		normalRandom: { times: [] },
+		memoRandom: { times: [] },
 	};
 }
 
@@ -186,13 +182,9 @@ function shiftedRenders(items: number[]): ListProps[] {
 }
 
 function measureUpdateBatch(render: (props: ListProps) => void, renders: ListProps[]) {
-	const callsBefore = heavyCallCount;
 	const startedAt = performance.now();
 	for (const props of renders) render(props);
-	return {
-		calls: (heavyCallCount - callsBefore) / UPDATES_PER_SAMPLE,
-		elapsed: (performance.now() - startedAt) / UPDATES_PER_SAMPLE,
-	};
+	return (performance.now() - startedAt) / UPDATES_PER_SAMPLE;
 }
 
 function validateOrder(host: HTMLElement, items: number[]): void {
@@ -233,15 +225,12 @@ function measureUpdates(host: HTMLElement): BenchmarkSamples {
 	const update = (definition: CaseDefinition, record: boolean) => {
 		const state = states.get(definition.key)!;
 		const renders = shiftedRenders(state.items);
-		const sample = measureUpdateBatch(
+		const elapsed = measureUpdateBatch(
 			(props) => flushSync(() => state.root.render(definition.Component, props)),
 			renders,
 		);
 		state.items = renders[renders.length - 1].items;
-		if (record) {
-			samples[definition.key].calls.push(sample.calls);
-			samples[definition.key].times.push(sample.elapsed);
-		}
+		if (record) samples[definition.key].times.push(elapsed);
 	};
 
 	for (let i = 0; i < WARMUP_RUNS; i++) {
@@ -285,10 +274,7 @@ async function runBenchmark(): Promise<void> {
 	lines.push('', 'Shift first item to end');
 	for (const definition of CASES) {
 		const samples = updates[definition.key];
-		lines.push(
-			`${definition.label}: ${median(samples.times).toFixed(2)} ms/update, ` +
-				`${median(samples.calls).toFixed(0)} heavy calls/update`,
-		);
+		lines.push(`${definition.label}: ${median(samples.times).toFixed(2)} ms/update`);
 	}
 	lines.push(
 		'',
