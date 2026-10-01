@@ -7,7 +7,9 @@ import { useEditorState, type UseEditorStateOptions } from './useEditorState';
 type DependencyList = readonly unknown[];
 type MutableRefObject<T> = { current: T };
 
-const isDev = process.env.NODE_ENV !== 'production';
+// Source consumers may lack a `process` global (non-Node toolchains, embedders
+// without Node types) — guard instead of assuming the env.
+const isDev = typeof process === 'undefined' || process.env?.NODE_ENV !== 'production';
 const isSSR = typeof window === 'undefined';
 const isNext = isSSR || Boolean(typeof window !== 'undefined' && (window as any).next);
 
