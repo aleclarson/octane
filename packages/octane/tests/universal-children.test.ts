@@ -117,6 +117,61 @@ export function Scene() @{ <view>{List({ children: null })}</view> }
 		expect(entries).toHaveLength(2);
 	});
 
+	it('encodes symbol and bigint keys distinctly', () => {
+		const { container, root } = objectRoot();
+		const List = defineUniversalComponent(RENDERER, (props: { children?: UniversalRenderable }) =>
+			Children.toArray(props.children),
+		);
+		const rows = [
+			universalKey(Symbol('a'), item('first')),
+			universalKey(Symbol('a'), item('second')),
+			universalKey(1n, item('bigint')),
+			universalKey('1', item('string')),
+			universalKey(1, item('number')),
+		];
+		const entries = Children.toArray(rows);
+		const keys = entries.map((entry) => (entry as { key?: unknown }).key);
+		expect(new Set(keys).size).toBe(5);
+		root.render(List, { children: universalChildren(RENDERER, () => rows) });
+		const first = container.children[0];
+		expect(names(container)).toEqual(['first', 'second', 'bigint', 'string', 'number']);
+		root.render(List, {
+			children: universalChildren(RENDERER, () => [rows[4], rows[3], rows[2], rows[1], rows[0]]),
+		});
+		expect(names(container)).toEqual(['number', 'string', 'bigint', 'second', 'first']);
+		expect(container.children[4]).toBe(first);
+	});
+
+	it('keeps an unkeyed fragment positional instead of adopting its child key', () => {
+		const { container, root } = objectRoot();
+		const List = defineUniversalComponent(RENDERER, (props: { children?: UniversalRenderable }) =>
+			Children.toArray(props.children),
+		);
+		root.render(List, {
+			children: universalChildren(RENDERER, () => [
+				universalKey('k', item('keyed')),
+				universalValue(
+					universalPlan(RENDERER, {
+						kind: 'range',
+						children: [{ kind: 'host', type: 'item', propsSlot: 0 }],
+					}),
+					[
+						universalProps([
+							['set', 'id', 'frag'],
+							['set', 'key', 'k'],
+						]),
+					],
+				),
+			]),
+		});
+		expect(names(container)).toEqual(['keyed', 'frag']);
+	});
+
+	it('returns nullish input from map unchanged', () => {
+		expect(Children.map(null, (child) => child)).toBe(null);
+		expect(Children.map(undefined, (child) => child)).toBe(undefined);
+	});
+
 	it('drops null and boolean children', () => {
 		expect(Children.toArray([item('a'), null, false, true])).toHaveLength(1);
 	});

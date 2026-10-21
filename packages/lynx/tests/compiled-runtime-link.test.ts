@@ -52,12 +52,12 @@ const SETUP_BLOCK_SOURCE = `
 const CHILDREN_MAP_SOURCE = `
 	import { Children } from 'octane';
 
-	export function App(props) @{
-		<view>
-			{Children.map(props.children, (child) => child)}
-			<text>{'A'}</text>
-			<text>{'B'}</text>
-		</view>
+	function Wrap(props) @{
+		<view>{Children.map(props.children, (child) => <view>{child}</view>)}</view>
+	}
+
+	export function App() @{
+		<Wrap><text>{'A'}</text><text>{'B'}</text></Wrap>
 	}
 `;
 
@@ -309,6 +309,9 @@ describe('Lynx compiled output links against its renderer runtime', () => {
 				expect.objectContaining({ op: 'create', type: '#text', props: { value } }),
 			);
 		}
+		expect(
+			main.commands.filter((command: { op: string; type?: string }) => command.type === 'view'),
+		).toHaveLength(3);
 		expect(main).toEqual(background);
 	});
 

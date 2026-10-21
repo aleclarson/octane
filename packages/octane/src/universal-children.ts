@@ -62,6 +62,26 @@ interface UniversalChildEntry {
 	readonly key: string;
 }
 
+// Injective key encoding over every UniversalKey segment type. Symbols get a
+// stable per-process id — a Map, not a WeakMap: registered symbols can't be
+// WeakMap keys and this stays PrimJS-safe for first-screen renderers.
+const CHILD_KEY_SYMBOL_IDS = new Map<symbol, number>();
+
+function encodeChildKeySegment(segment: unknown): string {
+	if (typeof segment === 'string') return JSON.stringify(segment);
+	if (typeof segment === 'bigint') return `${segment}n`;
+	if (typeof segment === 'symbol') {
+		let id = CHILD_KEY_SYMBOL_IDS.get(segment);
+		if (id === undefined) CHILD_KEY_SYMBOL_IDS.set(segment, (id = CHILD_KEY_SYMBOL_IDS.size));
+		return `@${id}`;
+	}
+	return String(segment);
+}
+
+function encodeChildKey(path: readonly unknown[]): string {
+	return path.map(encodeChildKeySegment).join(',');
+}
+
 /** Renderer-supported child collection operations. They never render a component
  *  to discover its output. Returned entries retain their keys when mapped into
  *  wrapper hosts, and are materialized normally at their eventual placement. */
@@ -82,7 +102,6 @@ export function createUniversalChildren(runtime: UniversalChildrenRuntime) {
 			if ((child as UniversalPlanValue)?.$$kind !== UNIVERSAL_VALUE) return null;
 			const { plan, values } = child as UniversalPlanValue;
 			let node = plan.root;
-			while (node.kind === 'range' && node.children.length === 1) node = node.children[0];
 			if (node.kind === 'slot') return collectionKey(values[node.slot] as UniversalRenderable);
 			if (node.kind !== 'host' && node.kind !== 'component') return null;
 			if (node.kind === 'component' && node.keySlot !== undefined)
@@ -126,7 +145,7 @@ export function createUniversalChildren(runtime: UniversalChildrenRuntime) {
 				const value = child as UniversalPlanValue;
 				checkRenderer(value.plan.renderer);
 				if (value.key !== null) {
-					out.push({ child, key: JSON.stringify([...path, 'key', value.key]) });
+					out.push({ child, key: encodeChildKey([...path, 'key', value.key]) });
 					return;
 				}
 				const visitNode = (node: UniversalPlanNode, nodePath: readonly unknown[]): void => {
@@ -157,7 +176,7 @@ export function createUniversalChildren(runtime: UniversalChildrenRuntime) {
 						const item = universalValue(universalPlan(value.plan.renderer, node), value.values);
 						out.push({
 							child: item,
-							key: JSON.stringify(
+							key: encodeChildKey(
 								key == null
 									? nodePath
 									: [...(node === value.plan.root ? path : nodePath.slice(0, -1)), 'key', key],
@@ -169,7 +188,7 @@ export function createUniversalChildren(runtime: UniversalChildrenRuntime) {
 				return;
 			}
 			const key = renderableKey(child);
-			out.push({ child, key: JSON.stringify(key === null ? path : [...path, 'key', key]) });
+			out.push({ child, key: encodeChildKey(key === null ? path : [...path, 'key', key]) });
 		};
 		visit(children, []);
 		return out;
@@ -191,14 +210,15 @@ export function createUniversalChildren(runtime: UniversalChildrenRuntime) {
 		map(
 			children: UniversalRenderable,
 			fn: (child: UniversalRenderable, index: number) => UniversalRenderable,
-		): UniversalRenderable[] {
+		): UniversalRenderable[] | null | undefined {
+			if (children == null) return children;
 			const out: UniversalRenderable[] = [];
 			universalChildEntries(children).forEach(({ child, key }, index) => {
 				const mapped = fn(child, index);
 				if (mapped == null || typeof mapped === 'boolean') return;
 				if (Array.isArray(mapped)) {
 					for (const entry of universalChildEntries(mapped as UniversalRenderable)) {
-						out.push(normalizedChild(JSON.stringify([key, entry.key]), entry.child));
+						out.push(normalizedChild(encodeChildKey([key, entry.key]), entry.child));
 					}
 				} else {
 					out.push(normalizedChild(key, mapped));
