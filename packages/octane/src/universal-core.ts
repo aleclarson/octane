@@ -1687,6 +1687,166 @@ function renderableKey(value: UniversalRenderable): UniversalKey | null {
 	return null;
 }
 
+// Keys assigned by Children.toArray/map, so re-normalizing a returned entry
+// keeps the key instead of re-walking a wrapper plan.
+const NORMALIZED_CHILD_KEYS = new WeakMap<object, string>();
+
+interface UniversalChildEntry {
+	readonly child: UniversalRenderable;
+	readonly key: string;
+}
+
+/** Normalize deferred JSX without mounting components or consuming their context.
+ *  Structural owners (blocks, providers, boundaries and loops) remain renderables;
+ *  only transparent child groups, plan ranges, slots and JS arrays are flattened. */
+function universalChildEntries(children: UniversalRenderable): UniversalChildEntry[] {
+	const out: UniversalChildEntry[] = [];
+	const collectionKey = (child: UniversalRenderable): UniversalKey | null => {
+		const key = renderableKey(child);
+		if (key !== null) return key;
+		if ((child as UniversalPlanValue)?.$$kind !== UNIVERSAL_VALUE) return null;
+		const { plan, values } = child as UniversalPlanValue;
+		let node = plan.root;
+		while (node.kind === 'range' && node.children.length === 1) node = node.children[0];
+		if (node.kind === 'slot') return collectionKey(values[node.slot] as UniversalRenderable);
+		if (node.kind !== 'host' && node.kind !== 'component') return null;
+		if (node.kind === 'component' && node.keySlot !== undefined)
+			return normalizeUniversalKey(values[node.keySlot]);
+		return normalizeUniversalKey(
+			node.propsSlot === undefined
+				? node.kind === 'host'
+					? node.props?.['key']
+					: null
+				: normalizePropsValue(values[node.propsSlot] as UniversalPropsValue).key,
+		);
+	};
+	const visit = (child: UniversalRenderable, path: readonly unknown[]): void => {
+		if (child == null || typeof child === 'boolean') return;
+		if (typeof child === 'object') {
+			const normalizedKey = NORMALIZED_CHILD_KEYS.get(child);
+			if (normalizedKey !== undefined) {
+				out.push({ child, key: normalizedKey });
+				return;
+			}
+		}
+		if (Array.isArray(child)) {
+			(child as readonly UniversalRenderable[]).forEach((item, index) => {
+				const key = collectionKey(item);
+				visit(item, [...path, key === null ? 'index' : 'key', key ?? index]);
+			});
+			return;
+		}
+		if ((child as UniversalChildrenValue)?.$$kind === UNIVERSAL_CHILDREN) {
+			const children = child as UniversalChildrenValue;
+			if (CURRENT_OWNER !== null && children.renderer !== currentAttempt().root.renderer) {
+				throw new Error('Universal renderer mismatch while normalizing children.');
+			}
+			visit(children.render(), path);
+			return;
+		}
+		if ((child as UniversalListValue)?.$$kind === UNIVERSAL_LIST) {
+			const list = child as UniversalListValue;
+			visit(list.values.length === 0 ? (list.empty as UniversalRenderable) : list.values, path);
+			return;
+		}
+		if ((child as UniversalPlanValue)?.$$kind === UNIVERSAL_VALUE) {
+			const value = child as UniversalPlanValue;
+			if (CURRENT_OWNER !== null && value.plan.renderer !== currentAttempt().root.renderer) {
+				throw new Error('Universal renderer mismatch while normalizing children.');
+			}
+			if (value.key !== null) {
+				out.push({ child, key: JSON.stringify([...path, 'key', value.key]) });
+				return;
+			}
+			const visitNode = (node: UniversalPlanNode, nodePath: readonly unknown[]): void => {
+				if (node.kind === 'range') {
+					node.children.forEach((item, index) => visitNode(item, [...nodePath, index]));
+				} else if (node.kind === 'slot') {
+					visit(value.values[node.slot] as UniversalRenderable, nodePath);
+				} else if (node.kind === 'text') {
+					visit(
+						(node.slot === undefined ? node.value : value.values[node.slot]) as UniversalRenderable,
+						nodePath,
+					);
+				} else {
+					const key =
+						node.kind === 'component'
+							? node.keySlot === undefined
+								? node.propsSlot === undefined
+									? null
+									: normalizePropsValue(value.values[node.propsSlot] as UniversalPropsValue).key
+								: value.values[node.keySlot]
+							: node.kind === 'host'
+								? node.propsSlot === undefined
+									? (node.props?.['key'] ?? null)
+									: normalizePropsValue(value.values[node.propsSlot] as UniversalPropsValue).key
+								: null;
+					const item = universalValue(universalPlan(value.plan.renderer, node), value.values);
+					out.push({
+						child: item,
+						key: JSON.stringify(
+							key == null
+								? nodePath
+								: [...(node === value.plan.root ? path : nodePath.slice(0, -1)), 'key', key],
+						),
+					});
+				}
+			};
+			visitNode(value.plan.root, path);
+			return;
+		}
+		const key = renderableKey(child);
+		out.push({ child, key: JSON.stringify(key === null ? path : [...path, 'key', key]) });
+	};
+	visit(children, []);
+	return out;
+}
+
+/** Wrap a normalized child so its collection key survives into its eventual placement. */
+function normalizedChild(key: string, child: UniversalRenderable): UniversalRenderable {
+	const value = universalKey(key, child);
+	if (typeof value === 'object' && value !== null) NORMALIZED_CHILD_KEYS.set(value, key);
+	return value;
+}
+
+/** Renderer-supported child collection operations. They never render a component
+ *  to discover its output. Returned entries retain their keys when mapped into
+ *  wrapper hosts, and are materialized normally at their eventual placement. */
+export const Children = {
+	toArray(children: UniversalRenderable): UniversalRenderable[] {
+		return universalChildEntries(children).map(({ child, key }) =>
+			typeof child === 'object' && child !== null ? normalizedChild(key, child) : child,
+		);
+	},
+	map(
+		children: UniversalRenderable,
+		fn: (child: UniversalRenderable, index: number) => UniversalRenderable,
+	): UniversalRenderable[] {
+		const out: UniversalRenderable[] = [];
+		universalChildEntries(children).forEach(({ child, key }, index) => {
+			const mapped = fn(child, index);
+			if (mapped == null || typeof mapped === 'boolean') return;
+			if (Array.isArray(mapped)) {
+				for (const entry of universalChildEntries(mapped as UniversalRenderable)) {
+					out.push(normalizedChild(JSON.stringify([key, entry.key]), entry.child));
+				}
+			} else {
+				out.push(normalizedChild(key, mapped));
+			}
+		});
+		return out;
+	},
+};
+
+/**
+ * Marks a component binding whose authored JSX children must remain inspectable
+ * element descriptors. The DOM compiler consumes the call; universal children are
+ * already inspectable through `Children`, so the marker is a no-op here.
+ */
+export function descriptorChildren<T>(component: T): T {
+	return component;
+}
+
 function defineUniversalProtoProp(props: Record<PropertyKey, unknown>, value: unknown): void {
 	// Assignment would invoke Object.prototype.__proto__ instead of creating
 	// the own data property required by object-spread/JSX semantics.
