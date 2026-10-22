@@ -9,6 +9,8 @@ export interface CompileRenderer {
 	module: string;
 	target: 'dom' | 'universal' | 'valdi';
 	server?: string;
+	/** `scoped-styles` requires registerUniversalStyles and normalizeClass in module. */
+	capabilities?: readonly string[];
 	/** Additional normalized renderer capabilities. */
 	[option: string]: unknown;
 }

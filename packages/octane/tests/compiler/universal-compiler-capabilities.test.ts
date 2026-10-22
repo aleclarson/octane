@@ -198,6 +198,17 @@ describe('universal compiler renderer capabilities', () => {
 		);
 	});
 
+	it.each(['<style>{css}</style>', '<style href="a.css" precedence="default" />'])(
+		'diagnoses style resources outside the static CSS contract: %s',
+		(output) => {
+			expect(() =>
+				compile(`export function Scene({css}) @{ ${output} }`, '/src/Scene.object.tsrx', {
+					renderer: { ...baseRenderer, capabilities: ['scoped-styles'] },
+					hmr: false,
+				}),
+			).toThrow(/supports static raw CSS blocks, not browser <style>/);
+		},
+	);
 	it('keeps scoped styles behind an explicit renderer style/assets capability', () => {
 		expect(() =>
 			compile(
@@ -208,7 +219,7 @@ describe('universal compiler renderer capabilities', () => {
 				{ renderer: { ...baseRenderer, text: 'host' }, hmr: false },
 			),
 		).toThrow(
-			/scoped <style> requires a renderer style\/assets capability\. at \/src\/Scene\.object\.tsrx:/,
+			/scoped <style> requires renderer capabilities: \["scoped-styles"\] and a registerUniversalStyles export\. at \/src\/Scene\.object\.tsrx:/,
 		);
 	});
 
@@ -225,7 +236,7 @@ describe('universal compiler renderer capabilities', () => {
 				{ renderer: { ...baseRenderer, text: 'host' }, hmr: false },
 			),
 		).toThrow(
-			/scoped <style> requires a renderer style\/assets capability\. at \/src\/Scene\.object\.tsrx:/,
+			/scoped <style> requires renderer capabilities: \["scoped-styles"\] and a registerUniversalStyles export\. at \/src\/Scene\.object\.tsrx:/,
 		);
 		// …and declaring a theme in the universal module itself is rejected before
 		// the template is even reached (a module-level `<style>` value cannot be
