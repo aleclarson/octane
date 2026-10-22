@@ -347,7 +347,7 @@ describe('universal scoped styles', () => {
 				},
 			);
 			const lowered = [0, 1].map((index) => {
-				const child = `function Child${index}() @{ <><style>view { color: red }</style><view /></> }`;
+				const child = `function Child${index}() @{ const theme = <style>.row { color: red }</style>; <view class={theme.row} /> }`;
 				return lowerUniversalRendererRegion(
 					`<Child${index} />`,
 					'/src/Regions.tsrx',

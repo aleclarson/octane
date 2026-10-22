@@ -61,6 +61,87 @@ function scopeUniversalStyles(ast, state) {
 	return { ...ast, body };
 }
 
+// A captured class string does not transport the owner's CSS into another
+// renderer. Diagnose statically identifiable theme captures, including aliases,
+// while allowing themes declared inside the specialized unit itself.
+function validateRegionStyleCaptures(ast, authoredAst, state) {
+	if (!authoredAst || !rendererHasCapability(state, 'scoped-styles')) return;
+	const walk = (node, visit, parent = null, key = null) => {
+		if (!node || typeof node !== 'object') return;
+		visit(node, parent, key);
+		forEachRuntimeAstChild(node, (child, childKey) => walk(child, visit, node, childKey));
+	};
+	const includedStyles = new Set();
+	walk(ast, (node) => {
+		if (node.type === 'JSXStyleElement') includedStyles.add(node.start);
+	});
+	const lexical = createLexicalAnalysis(authoredAst);
+	const declarations = [];
+	const bindings = new Map();
+	walk(authoredAst, (node) => {
+		if (node.type !== 'VariableDeclarator' || !node.init) return;
+		const record = { init: node.init, external: false, users: [] };
+		declarations.push(record);
+		const names = new Set();
+		addPatternNames(node.id, names);
+		for (const name of names) {
+			const scope = lexical.resolveBinding(
+				lexical.nodeScopes.get(node.id) ?? lexical.rootScope,
+				name,
+			)?.scope;
+			if (!scope) continue;
+			if (!bindings.has(scope)) bindings.set(scope, new Map());
+			bindings.get(scope).set(name, record);
+		}
+	});
+	const bindingFor = (node) => {
+		const scope = lexical.resolveBinding(
+			lexical.nodeScopes.get(node) ?? lexical.rootScope,
+			node.name,
+		)?.scope;
+		return bindings.get(scope)?.get(node.name);
+	};
+	const queue = [];
+	for (const record of declarations) {
+		walk(record.init, (node) => {
+			if (node.type === 'JSXStyleElement' && !includedStyles.has(node.start))
+				record.external = true;
+		});
+		for (const capture of collectEntryCaptures(record.init, new Set())) {
+			for (const node of capture.nodes) bindingFor(node)?.users.push(record);
+		}
+		if (record.external) queue.push(record);
+	}
+	for (let index = 0; index < queue.length; index++) {
+		for (const user of queue[index].users) {
+			if (!user.external) {
+				user.external = true;
+				queue.push(user);
+			}
+		}
+	}
+	const externalReferences = new Map();
+	walk(authoredAst, (node, parent, key) => {
+		if (
+			node.type === 'Identifier' &&
+			isIdentifierReference(node, parent, key, lexical) &&
+			bindingFor(node)?.external
+		) {
+			externalReferences.set(node.start, node.name);
+		}
+	});
+	for (const capture of collectEntryCaptures(ast, new Set())) {
+		for (const node of capture.nodes) {
+			if (!externalReferences.has(node.start)) continue;
+			throw universalError(
+				state.filename,
+				node,
+				`theme ${JSON.stringify(externalReferences.get(node.start))} crosses a renderer boundary without its CSS; declare the theme inside the universal region or in a module compiled for that renderer.`,
+			);
+		}
+	}
+}
+
 // Register before HMR scaffolding: a throwing host must not install its cleanup.
 function universalStyleStatementsAst(state, origin) {
 	if (!state.styles?.length) return [];
@@ -69,9 +150,13 @@ function universalStyleStatementsAst(state, origin) {
 		referenceHelper(state, 'styles'),
 		[
 			b.literal(`${state.filename}${state.planPrefix ? `#${state.planPrefix}` : ''}`),
-			jsonValueToAst(
-				state.styles.map(({ hash, css }) => ({ id: hash, css })),
-				origin,
+			b.array(
+				state.styles.map((sheet) =>
+					jsonValueToAst(
+						{ id: sheet.hash, css: sheet.css },
+						sheet.origins?.[0] ?? sheet.origin ?? origin,
+					),
+				),
 			),
 		],
 		origin,
@@ -4697,6 +4782,7 @@ export function lowerUniversalRendererRegionAst(
 		planPrefix: prefix,
 		validationImportReferences: [],
 	};
+	validateRegionStyleCaptures(analysisAst, options.authoredAst, state);
 	analysisAst = scopeUniversalStyles(analysisAst, state);
 	state.componentNames = collectComponentNames(analysisAst);
 	state.contextSourceFacts = createContextSourceFacts(analysisAst);
@@ -4950,6 +5036,7 @@ export function lowerUniversalRendererRegionAst(
 			}),
 			components: Object.freeze(state.components),
 			hmrComponents: Object.freeze(state.hmrComponents),
+			styles: state.styles ?? [],
 			bindings: Object.freeze([...specializationBindings]),
 			generatedRuntimeAliases,
 			renderer,
@@ -5103,6 +5190,7 @@ export function compileUniversal(
 		},
 		components: state.components,
 		hmrComponents: state.hmrComponents,
+		styles: state.styles ?? [],
 	};
 	const profileImport = universalProfileImportAst(state, moduleOrigin);
 	const threeHostIntrinsics = threeHostIntrinsicStatementsAst(state, moduleOrigin);

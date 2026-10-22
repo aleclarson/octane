@@ -1372,7 +1372,10 @@ returned disposer during module disposal, then register the replacement set on
 reevaluation. Vite also drains module cleanup on `hot.prune` when the module
 leaves the import graph. This removes deleted blocks, changed hashes, and CSS
 from modules that lose every style block. Imported themes retain their declaring module's
-ownership. HMR may briefly remove CSS between disposal and reevaluation; failed
+ownership. Themes must be declared inside the universal region or in a module
+compiled for that renderer. CSS is not transported across renderer boundaries;
+statically identifiable captures of owner-local themes (including aliases)
+diagnose rather than producing unmatched classes. HMR may briefly remove CSS between disposal and reevaluation; failed
 replacement evaluation does not restore the disposed styles.
 
 This capability accepts static raw CSS in TSRX blocks. It does not implement

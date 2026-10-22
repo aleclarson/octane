@@ -132,7 +132,15 @@ export interface CompileOptions {
 	renderer?: CompileRenderer;
 	rendererBoundaries?: Readonly<Record<string, Readonly<Record<string, CompileRendererBoundary>>>>;
 	rendererRegistry?: Readonly<
-		Record<string, { module: string; target: 'dom' | 'universal' | 'valdi'; server?: string }>
+		Record<
+			string,
+			{
+				module: string;
+				target: 'dom' | 'universal' | 'valdi';
+				server?: string;
+				capabilities?: readonly string[];
+			}
+		>
 	>;
 	universalRuntime?: { runtime: string; thread: 'background' | 'main-thread' };
 	clientOnlyImports?: readonly unknown[];

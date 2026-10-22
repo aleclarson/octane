@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
+import { decodeMappings } from '../_source-map.js';
 import { lynxMainThreadRenderer, lynxRenderer } from '../../../lynx/src/config.js';
 import { compile } from '../../src/compiler/compile.js';
 
@@ -196,6 +197,46 @@ describe('universal compiler renderer capabilities', () => {
 		).toThrow(
 			/Activity mode must be either "visible" or "hidden"\. at \/src\/Scene\.object\.tsrx:2:/,
 		);
+	});
+
+	it('maps each universal sheet to its own authored block', () => {
+		const source = `export function A() @{ <><style>view { color: red; }</style><view /></> }
+export function B() @{ <><style>view { color: blue; }</style><view /></> }`;
+		const options = { renderer: { ...baseRenderer, capabilities: ['scoped-styles'] }, hmr: false };
+		const result = compile(source, '/src/Styles.object.tsrx', options);
+		const mappings = decodeMappings(result.map.mappings);
+		const lines = result.code.split('\n');
+		for (const [line, color] of ['red', 'blue'].entries()) {
+			const generatedLine = lines.findIndex((text) => text.includes(`color: ${color}`));
+			const generatedColumn = lines[generatedLine].lastIndexOf(
+				'"',
+				lines[generatedLine].indexOf(`color: ${color}`),
+			);
+			const mapping = mappings[generatedLine]
+				.filter((segment) => segment[0] <= generatedColumn)
+				.at(-1);
+			expect(mapping?.slice(2, 4)).toEqual([line, source.split('\n')[line].indexOf('<style>')]);
+		}
+	});
+
+	it.each([
+		'const theme = <style>.row { color: red }</style>;',
+		'const base = <style>.row { color: red }</style>; const theme = base;',
+	])('diagnoses owner theme captures across renderer boundaries', (setup) => {
+		expect(() =>
+			compile(
+				`import { Canvas } from 'bridge'; ${setup}
+			export function App() @{ <Canvas><view class={theme.row} /></Canvas> }`,
+				'/src/Boundary.tsrx',
+				{
+					hmr: false,
+					rendererRegistry: { object: { ...baseRenderer, capabilities: ['scoped-styles'] } },
+					rendererBoundaries: {
+						bridge: { Canvas: { ownerRenderer: 'dom', childRenderer: 'object', prop: 'children' } },
+					},
+				},
+			),
+		).toThrow(/theme.*renderer boundary.*declare.*inside.*universal/i);
 	});
 
 	it.each(['<style>{css}</style>', '<style href="a.css" precedence="default" />'])(
